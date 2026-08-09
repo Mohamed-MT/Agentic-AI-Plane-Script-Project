@@ -34,9 +34,9 @@ except Exception:
 
 import os
 
-os.environ["OPENROUTER_API_KEY"] = "your-key-here"
+os.environ["OPENROUTER_API_KEY"] = "Insert Your API Key Here"
 
-import time, math, threading, queue, datetime, json, logging, operator as op_module, re
+import time, math, threading, queue, datetime, json, logging, operator as op_module, re, sys
 from pymavlink import mavutil
 import tcp_relay
 from agno.agent import Agent
@@ -122,6 +122,21 @@ flight_logger.addHandler(_fh)
 flight_logger.addHandler(_ch)
 
 def flog(level: str, msg: str):
+    # Self-healing: some Agno features (debug_mode, monitoring/telemetry,
+    # internal logging reconfiguration) can reset Python's logging state
+    # after this module's initial setup, which silently detaches _fh/_ch
+    # from flight_logger even though it isn't Agno's own logger. Rather
+    # than track down every possible cause, just re-attach on every call
+    # if we notice the handler is missing — cheap membership check, and
+    # guarantees flight.log keeps getting written no matter when/how
+    # often something upstream clears the handler list.
+    if _fh not in flight_logger.handlers:
+        flight_logger.handlers = []
+        flight_logger.addHandler(_fh)
+        flight_logger.addHandler(_ch)
+        flight_logger.propagate = False
+        flight_logger.setLevel(logging.DEBUG)
+        flight_logger.warning("flight_logger handler was detached externally — re-attached automatically.")
     getattr(flight_logger, level.lower(), flight_logger.info)(msg)
     # Explicit flush so messages reach disk even if the process exits abruptly
     try:
@@ -249,6 +264,251 @@ def _unreal_loop():
         time.sleep(1/60)
 
 threading.Thread(target=_unreal_loop, daemon=True).start()
+
+# ───────────────────────────────────────────────────────────────
+# AVA WEBUI TELEMETRY RELAY  →  POST /webrtc/telemetry
+#
+# Feeds the webui's map/UAV icon with REAL SITL position instead of its
+# backend-dev/ fake Berlin-orbit stub. This is intentionally NOT MAVProxy —
+# we already have live vehicle.location/vehicle.attitude data sitting in
+# this process (same source _unreal_loop already reads above), so this is
+# a second small loop of the exact same shape, just packing into the
+# webui's documented 24-float packet and REST POSTing it instead of
+# writing to the Unreal TCP relay. One process, one source of truth for
+# vehicle state, no separate MAVLink router needed.
+#
+# Packet shape per relay_readme.md, always exactly 24 floats:
+#   platform: lat, lon, alt, roll, pitch, yaw    (6)
+#   mount1:   roll, pitch, yaw                    (3)  — no gimbal on this
+#   mount2:   roll, pitch, yaw                    (3)  — airframe, so these
+#                                                          stay 0.0
+#   camera:   fov, mode                           (2)  — no camera, 0.0
+#   aux:      10 floats                          (10)  — aux[2..9] are the
+#                                                          camera-footprint
+#                                                          corners; kept as
+#                                                          NaN since there is
+#                                                          no gimbal to
+#                                                          project a footprint
+#                                                          from. Per the
+#                                                          mapping app's own
+#                                                          docs, NaN/null
+#                                                          there means the
+#                                                          footprint polygon
+#                                                          is correctly
+#                                                          omitted for that
+#                                                          frame — the UAV
+#                                                          icon still renders.
+# Rate matches the webui's own TELEMETRY_HZ default of 1Hz (see
+# relay_readme.md) — overridable via AVA_TELEMETRY_HZ if the deployed
+# backend is configured differently. NOTE: this was previously hardcoded
+# to 20Hz here despite this same comment claiming it matched the backend
+# default — that mismatch (posting far faster than the backend's own
+# 1Hz poll rate) is the likely cause of visible twitching/instability in
+# the webui's UAV icon: most posts were silently overwritten before the
+# backend ever read them, and the ones that did get picked up landed at
+# effectively random moments rather than a steady cadence, producing
+# visible jumps instead of smooth motion.
+# ───────────────────────────────────────────────────────────────
+AVA_TELEMETRY_URL = os.environ.get("AVA_TELEMETRY_URL",
+                                    "http://localhost:8000/webrtc/telemetry")
+AVA_TELEMETRY_HZ  = float(os.environ.get("AVA_TELEMETRY_HZ", "1"))
+
+def _build_telemetry_packet():
+    """Pack current vehicle state into the webui's 24-float packet shape."""
+    loc = vehicle.location.global_relative_frame
+    att = vehicle.attitude
+    return {
+        "platform": {
+            "lat":   loc.lat or 0.0,
+            "lon":   loc.lon or 0.0,
+            "alt":   loc.alt or 0.0,
+            "roll":  math.degrees(att.roll),
+            "pitch": math.degrees(att.pitch),
+            "yaw":   math.degrees(att.yaw),
+        },
+        "mount1": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+        "mount2": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+        "camera": {"fov": 0.0, "mode": 0.0},
+        # aux[0..1] unused/reserved; aux[2..9] = footprint TL/TR/BR/BL.
+        # No gimbal on this airframe -> None (serializes to JSON `null`)
+        # so the footprint polygon is correctly omitted (per the mapping
+        # app's own null/NaN handling), while the UAV position icon still
+        # renders from `platform`. IMPORTANT: this must be None, not
+        # float('nan') — Python's json.dumps() emits float('nan') as a
+        # bare, unquoted `NaN` token, which is NOT valid JSON per spec and
+        # gets rejected by strict parsers (e.g. FastAPI/Pydantic on the
+        # receiving end, or the browser's JSON.parse). None -> `null` is
+        # valid JSON and is explicitly the documented alternative.
+        "aux": [0.0, 0.0, None, None, None, None, None, None, None, None],
+    }
+
+def _ava_telemetry_loop():
+    """
+    Mirrors _unreal_loop's structure exactly, but targets the webui's REST
+    telemetry endpoint instead of the Unreal TCP relay. Runs only if
+    'requests' is importable and AVA_TELEMETRY_URL is reachable; failures
+    are swallowed per-tick so a webui outage never affects flight control,
+    same as every other bridge in this script.
+
+    Logs a rolling summary of POST latency + how often the loop falls
+    behind its target interval every ~10s via flog() (NOT print — this
+    goes to flight.log only, since print() here would also spam the
+    webui's own chat feed through the stdout tee, which is the wrong
+    place for telemetry-plumbing diagnostics). Useful for telling apart
+    "the interval is too slow" from "each request itself is too slow"
+    when the map feels like it isn't keeping up.
+    """
+    try:
+        import requests as _requests
+    except ImportError:
+        print("[AVA-TELEMETRY] 'requests' not installed — skipping webui "
+              "telemetry relay (chat bridge still works independently).")
+        return
+    interval = 1.0 / max(AVA_TELEMETRY_HZ, 0.01)  # guard only against 0/negative
+    session = _requests.Session()
+    _last_report = time.time()
+    _tick_count = 0
+    _behind_count = 0
+    _latency_total = 0.0
+    while True:
+        _t0 = time.time()
+        try:
+            packet = _build_telemetry_packet()
+            session.post(AVA_TELEMETRY_URL, json=packet, timeout=2.0)
+        except Exception:
+            pass  # never let a webui hiccup affect flight control
+        _elapsed = time.time() - _t0
+        _tick_count += 1
+        _latency_total += _elapsed
+        if _elapsed > interval:
+            _behind_count += 1
+        sleep_for = interval - _elapsed
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        if time.time() - _last_report >= 10.0 and _tick_count > 0:
+            avg_ms = (_latency_total / _tick_count) * 1000
+            flog("info", f"AVA-TELEMETRY: {_tick_count} posts/10s, "
+                          f"avg latency {avg_ms:.0f}ms, target interval "
+                          f"{interval*1000:.0f}ms, {_behind_count} tick(s) "
+                          f"fell behind")
+            _last_report = time.time()
+            _tick_count = 0
+            _behind_count = 0
+            _latency_total = 0.0
+
+threading.Thread(target=_ava_telemetry_loop, daemon=True).start()
+
+# ───────────────────────────────────────────────────────────────
+# FLIGHT CHAT BRIDGE  →  AvA webui (/api/flight-chat, REST)
+#
+# Replaces the earlier WebSocket-based FlightIoBridge. Per the real
+# docs/AGENT_INTERFACE.md spec, the webui's actual chat transport is plain
+# REST polling — POST to send, GET with an after_id cursor to receive —
+# not the WebSocket. The WebSocket exists for observing live traffic only;
+# messages sent over it are NOT recorded into the chat history the
+# operator actually sees, per the doc's "one rule that will bite you."
+#
+# chat_bridge.py is the exact file from backend/examples/chat_bridge.py,
+# copied verbatim into this project (no ava-web import, stdlib + requests
+# only, per its own docstring). It runs fully synchronously — no threads,
+# no async — which fits this script's existing sync DroneKit code with
+# nothing extra to manage.
+#
+# We use ChatBridge.poll() directly (not the blocking .run()/.listen()
+# helpers) so this integrates into the SAME single-threaded main loop this
+# script already has, exactly like the old poll_input() did.
+# ───────────────────────────────────────────────────────────────
+from chat_bridge import ChatBridge
+
+FLIGHT_CHAT_BASE_URL = os.environ.get("FLIGHT_CHAT_BASE_URL", "http://localhost:8000")
+
+import re as _re_ansi
+
+_ANSI_RE = _re_ansi.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# Box-drawing characters Agno/rich use to render panels (┏━┓┃┗┛├┤┬┴┼) —
+# these render fine in a real terminal but are meaningless in a plain-text
+# web chat once the color codes around them are stripped. Rather than only
+# rejecting lines that are ENTIRELY border (which misses "┃ Mode: AUTO ┃"
+# style lines that mix real content with leftover sidebar characters),
+# these characters are stripped OUT of every line, so only the actual
+# content remains.
+_BOX_CHARS = "┏┓┗┛━┃┠┨┯┷┿─│┌┐└┘├┤┬┴┼╭╮╰╯"
+_BOX_TRANS = str.maketrans("", "", _BOX_CHARS)
+
+class _StdoutTee:
+    """
+    Mirrors stdout into the Flight tab via ChatBridge.send(), one line at a
+    time, without touching any of the existing print() call sites
+    throughout this file.
+
+    Agno's Agent.print_response(stream=True) renders output as a
+    rich/ANSI-formatted boxed panel meant for a real terminal — raw escape
+    codes (color) and box-drawing borders. A plain-text web chat has no
+    ANSI interpreter, so that formatting has to be stripped rather than
+    forwarded as-is, or it shows up as literal garbage characters and
+    stray ">> " prompt fragments in the Flight tab.
+
+    What gets sent to the bridge, per line:
+      1. ANSI escape sequences (colors) are stripped.
+      2. Box-drawing border characters are stripped (leaving any real
+         content that was inside the panel, e.g. "┃ Mode: AUTO ┃"
+         becomes "Mode: AUTO").
+      3. What's left is trimmed; if empty, blank, a bare ">>" prompt
+         fragment, or a pure "===.../---..." separator line (this
+         script's own CLI banners), the line is dropped entirely.
+      4. Anything else — actual status text, agent responses, mission
+         results, error messages — is sent through as plain text.
+    """
+    def __init__(self, real_stdout, bridge):
+        self.real = real_stdout
+        self.bridge = bridge
+        self._buf = ""
+
+    def _clean(self, raw_line: str) -> str:
+        s = _ANSI_RE.sub("", raw_line)
+        return s.translate(_BOX_TRANS).strip()
+
+    def _worth_sending(self, cleaned: str) -> bool:
+        if not cleaned:
+            return False
+        if cleaned == ">>":
+            return False  # bare input-prompt fragment
+        if cleaned == len(cleaned) * cleaned[0] and cleaned[0] in ("=", "-"):
+            return False  # this script's own banner separator lines
+        return True
+
+    def write(self, s):
+        self.real.write(s)
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            clean = self._clean(line)
+            if self._worth_sending(clean):
+                try:
+                    self.bridge.send(clean)
+                except Exception:
+                    pass  # never let a chat-post failure break console output
+
+    def flush(self):
+        self.real.flush()
+
+
+# Connect the bridge AFTER the vehicle + Unreal relay are already up, so a
+# slow/unavailable webui backend never delays getting the plane connected.
+# ChatBridge does no I/O in its constructor (per its own docstring), so
+# building it here is cheap even if the backend turns out to be down —
+# the real failure point is the first poll()/send() call, handled below.
+flight_bridge = None
+try:
+    flight_bridge = ChatBridge(FLIGHT_CHAT_BASE_URL, channel="flight",
+                                speaker="Pilot Agent", history="skip")
+    flight_bridge.send("Pilot agent online.")
+    sys.stdout = _StdoutTee(sys.stdout, flight_bridge)
+    print(f"[BRIDGE] Connected to {FLIGHT_CHAT_BASE_URL}/api/flight-chat")
+except Exception as _be:
+    flight_bridge = None
+    print(f"[BRIDGE] Flight chat unavailable ({_be}) — running in local CLI-only mode.")
+
 
 # ───────────────────────────────────────────────────────────────
 # SESSION STATE
@@ -391,6 +651,112 @@ def _nav_takeoff(alt, pitch=15):
                    0, 0, alt)
 
 # ───────────────────────────────────────────────────────────────
+# RUNWAY-ALIGNED LANDING APPROACH BUILDER
+#
+# Goal: land ON a specific named runway (e.g. "runway 35"), lined up with
+# its actual heading, instead of the old land() behaviour which just drops
+# DO_LAND_START + NAV_LAND at the home coordinate with no regard for runway
+# alignment. This matters now that the plane's position is shown on the
+# live Cesium map — landing needs to look and behave like it's actually
+# using the mapped runway, not just touching down near an arbitrary point.
+#
+# ArduPilot's own autoland guidance (ardupilot.org/plane/docs/
+# automatic-landing.html) is explicit that a proper autoland needs:
+#   1. A PRE-APPROACH waypoint the plane flies to first, positioned on the
+#      extended runway centerline, upwind of the threshold.
+#   2. A FINAL APPROACH point closer in and lower, establishing a shallow
+#      glide slope (recommended <=10%) into DO_LAND_START + NAV_LAND.
+# Dropping NAV_LAND directly at the threshold (the old land() approach)
+# skips both of these — the plane can arrive from any heading, which is
+# why "on a runway" wasn't really meaningful before this.
+#
+# RUNWAY GEOMETRY: two named threshold points (e.g. "runway 35" / "runway
+# 17") are read directly from PRESET_LOCATIONS and used as the single
+# source of truth for the runway's actual position, length, and heading.
+# Nothing here is hardcoded to an assumed runway length — if the two
+# threshold coordinates change (e.g. to match real Cesium/satellite data),
+# the approach geometry recalculates automatically from _haversine/_bearing
+# on those two points, so this stays correct even if the presets are later
+# updated to a real runway survey.
+# ───────────────────────────────────────────────────────────────
+def _build_runway_landing(threshold_name, opposite_end_name,
+                           approach_alt=60, pre_approach_dist_m=700,
+                           final_approach_dist_m=300, final_approach_alt=30):
+    """
+    Build a full runway-aligned landing mission: pre-approach waypoint ->
+    final approach waypoint -> DO_LAND_START -> NAV_LAND at the threshold.
+
+    threshold_name / opposite_end_name: keys into PRESET_LOCATIONS
+    identifying the two ends of the runway (e.g. "runway 35", "runway 17").
+    The plane lands AT threshold_name, approaching FROM the direction of
+    opposite_end_name extended backwards — i.e. it lines up on the runway's
+    actual centerline before touching down, the same way a real approach
+    works, rather than arriving from an arbitrary heading.
+
+    approach_alt: altitude for the pre-approach waypoint (AGL).
+    pre_approach_dist_m: how far upwind of the threshold the pre-approach
+        waypoint sits, along the extended centerline.
+    final_approach_dist_m: how far upwind of the threshold the final
+        approach waypoint sits (closer in than pre-approach).
+    final_approach_alt: altitude at the final approach waypoint — lower
+        than approach_alt, giving a shallow glide slope into the flare.
+        (rise/run should stay <=10% per ArduPilot's own guidance; the
+        defaults here give ~7.5% over the pre-to-final leg and 10% over the
+        final-to-touchdown leg — both within ArduPilot's <=10% guidance.)
+
+    Returns the list of Command objects. Caller uploads via _upload_mission
+    exactly like every other mission in this file.
+    """
+    if threshold_name not in PRESET_LOCATIONS:
+        raise ValueError(f"Unknown runway threshold '{threshold_name}'. "
+                          f"Available: {', '.join(PRESET_LOCATIONS)}")
+    if opposite_end_name not in PRESET_LOCATIONS:
+        raise ValueError(f"Unknown runway opposite end '{opposite_end_name}'. "
+                          f"Available: {', '.join(PRESET_LOCATIONS)}")
+
+    thresh = PRESET_LOCATIONS[threshold_name]
+    other  = PRESET_LOCATIONS[opposite_end_name]
+
+    # Approach heading = direction FROM the opposite end TOWARD the
+    # threshold — this is the actual centerline direction of travel a
+    # landing aircraft flies, derived straight from the two real runway
+    # points rather than assumed/hardcoded.
+    approach_hdg = _bearing_between(other["lat"], other["lon"],
+                                     thresh["lat"], thresh["lon"])
+
+    # Waypoints sit BEHIND the threshold along the reverse of the approach
+    # heading (i.e. further from the runway than the threshold itself),
+    # so the plane flies toward the threshold along the centerline instead
+    # of arriving from the side or overshooting past it.
+    reverse_hdg = (approach_hdg + 180.0) % 360.0
+    pre_lat, pre_lon = _offset_coord(thresh["lat"], thresh["lon"],
+                                      reverse_hdg, pre_approach_dist_m)
+    final_lat, final_lon = _offset_coord(thresh["lat"], thresh["lon"],
+                                          reverse_hdg, final_approach_dist_m)
+
+    cmds = [
+        _wp(pre_lat, pre_lon, approach_alt),               # pre-approach, on centerline
+        _wp(final_lat, final_lon, final_approach_alt),      # final approach, glide slope established
+        _do_land_start(),
+        _nav_land(thresh["lat"], thresh["lon"]),
+    ]
+    return cmds, approach_hdg
+
+
+def _bearing_between(lat1, lon1, lat2, lon2):
+    """
+    True bearing (degrees) from point 1 to point 2. Distinct from _bearing()
+    above, which parses a compass-word/number STRING into degrees — this
+    computes the bearing between two actual coordinate pairs, needed to
+    derive the runway's real approach heading from its two threshold points.
+    """
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    return math.degrees(math.atan2(y, x)) % 360.0
+
+# ───────────────────────────────────────────────────────────────
 # NON-STANDARD ORBIT PATTERN BUILDERS
 # racetrack / figure-eight / lawnmower — built from the same _wp() and
 # _loiter_turns() primitives above, no new MAV_CMD types needed.
@@ -407,28 +773,104 @@ def _nav_takeoff(alt, pitch=15):
 # entirely; the mission lists here are small enough that it doesn't matter.
 # ───────────────────────────────────────────────────────────────
 def _build_racetrack(center_lat, center_lon, altitude, heading,
-                      leg_length_m=400.0, turn_radius_m=150.0,
-                      turn_direction="right", laps=3):
+                      leg_length_m=84.39, turn_radius_m=36.5,
+                      turn_direction="right", laps=3, arc_points=16):
     """
-    Two parallel straight legs joined by two turns — a stretched oval,
-    like an aviation holding pattern. Good for loitering over something
-    elongated (a road, ridge, fence line) instead of a single point.
-    heading is the OUTBOUND leg direction. turn_direction: 'right' (CW,
-    positive loiter radius) or 'left' (CCW, negative radius).
+    A running-track ("stadium") shape: two straight, PARALLEL legs joined
+    at each end by a tight, clean semicircular arc — like a standard
+    athletics track, not a stretched-out aviation holding pattern. Two
+    straights + two uniform curves, closed loop.
+
+    Defaults match a real IAAF 400m running track: 84.39m straights and
+    a 36.5m curve radius (73m curve diameter) — this specific ratio
+    (straight:diameter roughly 1.16:1) is what makes it read as a running
+    track rather than an elongated oval. If the operator wants a wider
+    aviation-style holding pattern instead, they can pass a larger
+    turn_radius_m/leg_length_m — the geometry itself is the same either
+    way, only the proportions change.
+
+    heading is the OUTBOUND leg direction. turn_direction: 'right' (CW)
+    or 'left' (CCW) — which side the two legs sit on relative to heading,
+    and which way the arcs curve.
+
+    Geometry, all relative to the pattern's center point:
+      - Outbound leg:  runs along `heading`, offset turn_radius_m to one
+                        side, for leg_length_m.
+      - Turn 1 arc:     semicircle of radius turn_radius_m connecting the
+                        far end of the outbound leg to the far end of the
+                        return leg.
+      - Return leg:     runs along the reverse of `heading`, on the
+                        opposite offset side, back past center.
+      - Turn 2 arc:     semicircle connecting back to the start of the
+                        outbound leg, closing the oval.
+
+    arc_points: how many NAV_WAYPOINTs approximate each semicircular end
+    (default 16, upped from an earlier 8 now that the radius is much
+    smaller by default — more points keep the curve reading as a clean
+    round bend rather than a faceted polygon at this tighter scale;
+    higher = smoother but a longer mission list).
+
+    History: earlier versions used _loiter_turns(turns=1) at each corner
+    (a full 360-degree stop-and-circle command, not a turn — the "useless
+    circles" bug), then a version with plain single _wp() corners on ONE
+    straight line (correct direction, but a flat there-and-back line, no
+    curvature). This version restores real curved ends via multiple
+    waypoints, with defaults sized to look like an actual running track
+    rather than a stretched aviation oval.
     """
     hdg = _bearing(heading) if isinstance(heading, str) else float(heading) % 360.0
+    is_right = str(turn_direction).lower().startswith("r")
+    # Offset direction for the two legs: outbound leg is offset to the
+    # turn_direction side of the heading, return leg to the opposite side.
+    side_hdg = (hdg + 90.0) % 360.0 if is_right else (hdg - 90.0) % 360.0
+    r = abs(turn_radius_m)
     half = max(float(leg_length_m), 1.0) / 2.0
-    a_lat, a_lon = _offset_coord(center_lat, center_lon, hdg, half)
-    b_lat, b_lon = _offset_coord(center_lat, center_lon, (hdg + 180.0) % 360.0, half)
-    r = abs(turn_radius_m) if str(turn_direction).lower().startswith("r") else -abs(turn_radius_m)
+
+    # Leg centerlines, offset by +-r perpendicular to heading
+    out_lat, out_lon = _offset_coord(center_lat, center_lon, side_hdg, r)
+    ret_lat, ret_lon = _offset_coord(center_lat, center_lon, (side_hdg + 180.0) % 360.0, r)
+
+    # Four corner points of the oval (before rounding the ends into arcs)
+    out_start = _offset_coord(out_lat, out_lon, (hdg + 180.0) % 360.0, half)
+    out_end   = _offset_coord(out_lat, out_lon, hdg, half)
+    ret_start = _offset_coord(ret_lat, ret_lon, hdg, half)
+    ret_end   = _offset_coord(ret_lat, ret_lon, (hdg + 180.0) % 360.0, half)
+
+    def _arc(pivot_lat, pivot_lon, start_bearing, sweep_deg, n):
+        """n waypoints along a circle of radius r centred on (pivot_lat,
+        pivot_lon), sweeping sweep_deg degrees (signed) from start_bearing."""
+        pts = []
+        for i in range(1, n + 1):
+            frac = i / n
+            b = (start_bearing + sweep_deg * frac) % 360.0
+            pts.append(_offset_coord(pivot_lat, pivot_lon, b, r))
+        return pts
+
+    # Each end's arc pivots on the point beyond the leg ends, on the
+    # heading line, at distance r from both leg centerlines -> that's the
+    # true center point of the semicircle joining the two legs there.
+    sweep = 180.0 if is_right else -180.0
+    end1_pivot = _offset_coord(center_lat, center_lon, hdg, half)
+    end2_pivot = _offset_coord(center_lat, center_lon, (hdg + 180.0) % 360.0, half)
+
+    start_bearing_1 = _bearing_between(end1_pivot[0], end1_pivot[1], out_end[0], out_end[1])
+    start_bearing_2 = _bearing_between(end2_pivot[0], end2_pivot[1], ret_end[0], ret_end[1])
+
+    arc1 = _arc(end1_pivot[0], end1_pivot[1], start_bearing_1, sweep, arc_points)
+    arc2 = _arc(end2_pivot[0], end2_pivot[1], start_bearing_2, sweep, arc_points)
 
     cmds = []
     for _ in range(max(1, int(laps))):
-        cmds.append(_wp(a_lat, a_lon, altitude))
-        cmds.append(_loiter_turns(a_lat, a_lon, altitude, turns=1, radius=r))
-        cmds.append(_wp(b_lat, b_lon, altitude))
-        cmds.append(_loiter_turns(b_lat, b_lon, altitude, turns=1, radius=r))
-    return cmds, b_lat, b_lon
+        cmds.append(_wp(out_start[0], out_start[1], altitude))
+        cmds.append(_wp(out_end[0], out_end[1], altitude))
+        for lat, lon in arc1:
+            cmds.append(_wp(lat, lon, altitude))
+        cmds.append(_wp(ret_start[0], ret_start[1], altitude))
+        cmds.append(_wp(ret_end[0], ret_end[1], altitude))
+        for lat, lon in arc2:
+            cmds.append(_wp(lat, lon, altitude))
+    last = arc2[-1] if arc2 else (ret_end[0], ret_end[1])
+    return cmds, last[0], last[1]
 
 def _build_figure_eight(center_lat, center_lon, altitude, heading,
                          lobe_radius_m=150.0, loops=2, first_lobe="right"):
@@ -437,6 +879,29 @@ def _build_figure_eight(center_lat, center_lon, altitude, heading,
     flown in opposite directions so the ground track crosses itself — a
     figure-8 aligned along `heading`. Returns the crossing point as the
     last point, since each loiter_turns exits back near where it entered.
+
+    IMPORTANT — geometry note that explains the fix below: the crossing
+    point (center_lat, center_lon) sits ON the edge of BOTH lobe circles
+    (each lobe's true center is offset from the crossing point by exactly
+    lobe_radius_m). So when the plane is at the crossing point, it is
+    ALREADY positioned tangent to both circles — it does not need to fly
+    anywhere first.
+
+    A previous version inserted a _wp(lobe_center) before each
+    _loiter_turns(lobe_center). That _wp() target is the lobe's CENTER,
+    a completely different point from where the plane already is (the
+    crossing point sits on the circle's EDGE, one full radius away from
+    that center). So the plane would fly a straight line in toward the
+    center, and only once _loiter_turns took over did it realize it
+    needed to peel out onto a circle of radius lobe_radius_m around that
+    point — producing the abrupt "turns toward the side waypoint before
+    circling" correction that interrupts the figure-eight shape.
+
+    The fix: drop that _wp() entirely. NAV_LOITER_TURNS is given the
+    lobe's true center directly, and since the plane is already sitting
+    tangent to that circle at the crossing point, ArduPlane curves
+    straight into the orbit from its current heading — no detour toward
+    the center first.
     """
     hdg = _bearing(heading) if isinstance(heading, str) else float(heading) % 360.0
     r = abs(lobe_radius_m)
@@ -527,6 +992,28 @@ def _download_mission():
             "p3":      d["param3"],
         })
     return out
+
+def _remaining_mission_commands():
+    """
+    Return the Command objects still ahead in the CURRENTLY UPLOADED mission,
+    starting from vehicle.commands.next (the waypoint the autopilot is about
+    to fly to). Returns [] if nothing is uploaded or the mission has already
+    finished.
+
+    Used by nudge() to splice a brief detour waypoint in front of whatever
+    mission was already running, so the plane flies the detour then
+    continues straight into its original remaining waypoints — like a car
+    swerving around a pothole and settling back into its lane — instead of
+    replacing the mission and stopping to orbit at the detour point.
+    """
+    cmds = vehicle.commands
+    cmds.download()
+    cmds.wait_ready()
+    total = len(cmds)
+    if total == 0:
+        return []
+    idx = max(0, min(cmds.next, total))
+    return [c for i, c in enumerate(cmds) if i >= idx]
 
 # ───────────────────────────────────────────────────────────────
 # MODE HELPERS
@@ -659,6 +1146,60 @@ def _wait_mission_complete(timeout=600):
         time.sleep(1.0)
     flog("warning", "wait_mission_complete: timeout")
     return False
+
+# ───────────────────────────────────────────────────────────────
+# LANDING ACCURACY MEASUREMENT
+#
+# Answers "did it actually stop within N metres of the intended touchdown
+# point" — needed for the runway-landing task, since a mission can report
+# "complete" (mode left AUTO) without the plane having actually rolled to
+# a stop yet. Ground roll after touchdown still happens in DISARMED-adjacent
+# time, so we wait for the plane to be stationary (groundspeed near zero)
+# for a sustained period before taking the final position measurement,
+# rather than measuring the instant NAV_LAND completes.
+# ───────────────────────────────────────────────────────────────
+def _wait_for_stop(timeout=60, stationary_speed_ms=1.0, hold_seconds=3.0):
+    """
+    Block until groundspeed stays below stationary_speed_ms for hold_seconds
+    continuously (or timeout). Used after a landing mission to find the
+    plane's true final resting position, not just the moment NAV_LAND's
+    mission item completed.
+    """
+    t0 = time.time()
+    stable_since = None
+    while time.time() - t0 < timeout:
+        spd = vehicle.groundspeed or 0
+        if spd <= stationary_speed_ms:
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= hold_seconds:
+                return True
+        else:
+            stable_since = None
+        time.sleep(0.5)
+    flog("warning", "_wait_for_stop: timeout waiting for plane to stop rolling")
+    return False
+
+def measure_landing_accuracy(target_lat, target_lon, target_label=""):
+    """
+    Compare the plane's actual resting position against the intended
+    touchdown point (target_lat/target_lon), after waiting for it to
+    finish rolling out. Returns a dict with the miss distance in metres
+    and whether it's within the 100m goal.
+    """
+    _wait_for_stop()
+    cur = vehicle.location.global_relative_frame
+    miss_m = _haversine(cur.lat, cur.lon, target_lat, target_lon)
+    result = {
+        "target": target_label or f"({target_lat:.5f},{target_lon:.5f})",
+        "final_lat": cur.lat, "final_lon": cur.lon,
+        "miss_distance_m": round(miss_m, 1),
+        "within_100m": miss_m <= 100.0,
+    }
+    flog("info", f"LANDING ACCURACY vs {result['target']}: "
+                  f"{result['miss_distance_m']}m "
+                  f"({'PASS' if result['within_100m'] else 'MISS'} 100m goal)")
+    return result
 
 # ───────────────────────────────────────────────────────────────
 # LANDING SAFETY CHECK
@@ -985,7 +1526,7 @@ def executor_loop():
         try:
             # Nav actions: clear stop_flag unless hold is active
             if action in ("takeoff","execute_plan","fly_direction","nudge",
-                          "rtl","land","land_here","set_mode","set_speed",
+                          "rtl","land","land_here","runway_land","set_mode","set_speed",
                           "racetrack","figure_eight","lawnmower"):
                 if not _hold_active.is_set():
                     stop_flag.clear()
@@ -1031,12 +1572,18 @@ def executor_loop():
             # ── NUDGE (short obstacle-avoidance move) ──────────────────────
             elif action == "nudge":
                 # A deliberately SMALL, SHORT move — for avoiding something in
-                # the flight path right now. Unlike fly_direction (which is a
-                # full mission leg ending in an orbit), nudge ends in a single
-                # NAV_LOITER_TURNS(1) so the plane briefly stabilises and then
-                # the operator/agent decides what happens next. This keeps the
-                # plane under control instead of defaulting to an indefinite
-                # loiter, which was disorienting during avoidance manoeuvres.
+                # the flight path right now, then rejoining whatever mission
+                # was already running. We do this by capturing the remaining
+                # waypoints of the CURRENT mission (from vehicle.commands.next
+                # onward) and re-uploading [detour_wp] + remaining_waypoints
+                # as one mission — the plane flies through the detour point
+                # and straight into its original remaining route, no stop.
+                # This is like a car swerving around a pothole and settling
+                # back into its lane, rather than pulling over.
+                #
+                # If there's no active mission to rejoin (nothing queued),
+                # we fall back to a single stabilising loiter, since there's
+                # nowhere to "return" to.
                 direction = cmd["direction"]   # compass OR 'left'/'right'/'up'/'down'
                 dist      = cmd.get("distance", 50)
                 alt_delta = cmd.get("altitude_change", 0)
@@ -1062,14 +1609,29 @@ def executor_loop():
                     talt = cur_alt + alt_delta
 
                 talt = max(30, min(120, talt))
-                nudge_cmds = [_wp(tlat, tlon, talt), _loiter_turns(tlat, tlon, talt, turns=1, radius=120)]
+                remaining = _remaining_mission_commands()
+                # Tighter acceptance radius than a normal waypoint (40m vs the
+                # usual 50m default) — this is a brief swerve, so we want the
+                # plane to commit to the detour point itself before curving
+                # back onto its original track, not cut the corner early.
+                detour_wp = _wp(tlat, tlon, talt, acc_radius=40)
+                if remaining:
+                    nudge_cmds = [detour_wp] + remaining
+                else:
+                    nudge_cmds = [detour_wp, _loiter_turns(tlat, tlon, talt, turns=1, radius=120)]
                 _upload_mission(nudge_cmds)
                 vehicle.commands.next = 0
                 _set_mode("AUTO")
-                print(f"[PLANE] Nudging {direction} {dist}m @ {talt:.0f}m — brief stabilise, "
-                      f"then say where to go next.")
-                flog("info", f"NUDGE {direction} {dist}m -> ({tlat:.5f},{tlon:.5f}) @ {talt:.0f}m")
-                _log("nudge", {"direction": direction, "distance": dist, "alt": talt})
+                if remaining:
+                    print(f"[PLANE] Nudging {direction} {dist}m @ {talt:.0f}m — "
+                          f"rejoining the mission afterward ({len(remaining)} waypoint(s) left).")
+                else:
+                    print(f"[PLANE] Nudging {direction} {dist}m @ {talt:.0f}m — brief stabilise, "
+                          f"then say where to go next (no active mission to rejoin).")
+                flog("info", f"NUDGE {direction} {dist}m -> ({tlat:.5f},{tlon:.5f}) @ {talt:.0f}m | "
+                             f"{'rejoins ' + str(len(remaining)) + ' remaining item(s)' if remaining else 'no active mission — stabilise only'}")
+                _log("nudge", {"direction": direction, "distance": dist, "alt": talt,
+                               "resumed_items": len(remaining)})
 
             # ── TAKEOFF ──────────────────────────────────────────────────
             elif action == "takeoff":
@@ -1164,10 +1726,11 @@ def executor_loop():
                 cmds, last_lat, last_lon = _build_racetrack(
                     lat0, lon0, alt,
                     heading=cmd.get("heading", "north"),
-                    leg_length_m=cmd.get("leg_length_m", 400),
-                    turn_radius_m=cmd.get("turn_radius_m", 150),
+                    leg_length_m=cmd.get("leg_length_m", 84.39),
+                    turn_radius_m=cmd.get("turn_radius_m", 36.5),
                     turn_direction=cmd.get("turn_direction", "right"),
                     laps=cmd.get("laps", 3),
+                    arc_points=cmd.get("arc_points", 16),
                 )
                 end_land = cmd.get("end_with_land", False)
                 end_rtl  = cmd.get("end_with_rtl", False)
@@ -1178,7 +1741,7 @@ def executor_loop():
                     cmds.append(_rtl())
                 else:
                     cmds.append(_loiter_unlim(last_lat, last_lon, alt,
-                                               radius=cmd.get("turn_radius_m", 150)))
+                                               radius=cmd.get("turn_radius_m", 36.5)))
                 _upload_mission(cmds)
                 vehicle.commands.next = 0
                 _set_mode("AUTO")
@@ -1304,6 +1867,66 @@ def executor_loop():
                     print("[PLANE] Mission cleared — ready to arm again.")
                 except Exception as _le:
                     flog("warning", f"Post-land mission clear failed: {_le}")
+
+            # ── RUNWAY LAND (aligned approach onto a named runway) ──────────
+            elif action == "runway_land":
+                # Unlike land() (which drops straight onto home coords from
+                # whatever heading the plane happens to arrive on), this
+                # builds a proper aligned approach: pre-approach waypoint ->
+                # final approach waypoint (glide slope) -> DO_LAND_START ->
+                # NAV_LAND at the runway threshold. Geometry comes straight
+                # from the two named PRESET_LOCATIONS points, so it stays
+                # correct if those coordinates are ever updated to match
+                # real runway data shown on the Cesium map.
+                threshold = cmd["threshold"]
+                opposite  = cmd["opposite_end"]
+                try:
+                    land_cmds, approach_hdg = _build_runway_landing(
+                        threshold, opposite,
+                        approach_alt=cmd.get("approach_alt", 60),
+                        pre_approach_dist_m=cmd.get("pre_approach_dist_m", 700),
+                        final_approach_dist_m=cmd.get("final_approach_dist_m", 300),
+                        final_approach_alt=cmd.get("final_approach_alt", 30),
+                    )
+                except ValueError as _ve:
+                    print(f"[PLANE] [BLOCKED] {_ve}")
+                    command_queue.task_done()
+                    continue
+
+                _upload_mission(land_cmds)
+                vehicle.commands.next = 0
+                _set_mode("AUTO")
+                print(f"[PLANE] Runway landing — approaching '{threshold}' "
+                      f"aligned on heading {approach_hdg:.0f}°, lined up from "
+                      f"'{opposite}' end.")
+                flog("info", f"RUNWAY_LAND: threshold={threshold} opposite={opposite} "
+                             f"heading={approach_hdg:.1f}")
+                _log("runway_land", {"threshold": threshold, "heading": round(approach_hdg, 1)})
+
+                _wait_mission_complete(timeout=300)
+                if not stop_flag.is_set():
+                    print("[PLANE] Touchdown sequence complete — waiting for rollout to finish...")
+                    thresh_loc = PRESET_LOCATIONS[threshold]
+                    acc = measure_landing_accuracy(thresh_loc["lat"], thresh_loc["lon"], threshold)
+                    verdict = "within" if acc["within_100m"] else "OUTSIDE"
+                    print(f"[PLANE] Landed. Stopped {acc['miss_distance_m']}m from "
+                          f"'{threshold}' threshold — {verdict} the 100m goal.")
+                    mission_state["phase"] = "idle"
+                    mission_state["last_landing_accuracy"] = acc
+
+                # Same post-land arm-lock fix as the regular land action —
+                # ArduPlane refuses to arm again while a DO_LAND_START
+                # mission is still stored on the flight controller.
+                try:
+                    _rlcmds = vehicle.commands
+                    _rlcmds.download()
+                    _rlcmds.wait_ready()
+                    _rlcmds.clear()
+                    _rlcmds.upload()
+                    flog("info", "Post-runway-land mission cleared — arm lock released")
+                    print("[PLANE] Mission cleared — ready to arm again.")
+                except Exception as _rle:
+                    flog("warning", f"Post-runway-land mission clear failed: {_rle}")
 
             # ── LAND HERE (emergency — checks current position is safe) ────
             elif action == "land_here":
@@ -1472,6 +2095,7 @@ class PlaneToolkit(Toolkit):
         super().__init__(name="plane_toolkit", tools=[
             # Lifecycle
             self.arm_plane, self.disarm_plane, self.takeoff, self.return_home, self.land,
+            self.land_on_runway,
             self.land_here, self.check_safe_to_land,
             self.loiter_here, self.resume_flight,
             # Mission building
@@ -1532,6 +2156,53 @@ class PlaneToolkit(Toolkit):
         """
         command_queue.put({"action": "land"})
         return "land queued — plane will execute approach and touch down at home."
+
+    def land_on_runway(self, threshold: str, opposite_end: str,
+                        approach_alt: float = 60, pre_approach_dist_m: float = 700,
+                        final_approach_dist_m: float = 300,
+                        final_approach_alt: float = 30) -> str:
+        """
+        Land ALIGNED on a specific named runway, approaching from the correct
+        heading — not just touching down near a point. Use for 'land on
+        runway 35', 'land on the runway', 'land on runway 17 aligned',
+        or when the operator wants the landing to visibly track along the
+        runway on the live map rather than arrive from an arbitrary direction.
+
+        threshold: the runway end to land AT, e.g. 'runway 35'.
+        opposite_end: the OTHER end of the same runway, e.g. 'runway 17'.
+                      Used only to compute the real approach heading (the
+                      direction from opposite_end toward threshold) — the
+                      plane flies toward threshold, lined up on that heading.
+        approach_alt: altitude (AGL) at the pre-approach waypoint.
+        pre_approach_dist_m: distance upwind of the threshold where the
+                      plane first joins the runway centerline.
+        final_approach_dist_m: distance upwind of the threshold for the
+                      final approach point — closer in, lower altitude,
+                      establishing the glide slope before touchdown.
+        final_approach_alt: altitude (AGL) at the final approach point.
+
+        After touchdown, this automatically waits for the plane to fully
+        stop rolling and reports how far it stopped from the runway
+        threshold — use get_status() or check the printed output for that
+        figure if the operator asks how accurate the landing was.
+
+        Use land() instead if the operator just wants to land at home with
+        no runway-alignment requirement.
+        """
+        if threshold not in PRESET_LOCATIONS or opposite_end not in PRESET_LOCATIONS:
+            return (f"[BLOCKED] Unknown runway name(s). Available locations: "
+                    f"{', '.join(PRESET_LOCATIONS)}")
+        command_queue.put({
+            "action": "runway_land",
+            "threshold": threshold,
+            "opposite_end": opposite_end,
+            "approach_alt": approach_alt,
+            "pre_approach_dist_m": pre_approach_dist_m,
+            "final_approach_dist_m": final_approach_dist_m,
+            "final_approach_alt": final_approach_alt,
+        })
+        return (f"land_on_runway('{threshold}') queued — aligning approach from "
+                f"'{opposite_end}' direction, then landing and measuring stop accuracy.")
 
     def check_safe_to_land(self, latitude: float = None, longitude: float = None) -> str:
         """
@@ -1706,8 +2377,12 @@ class PlaneToolkit(Toolkit):
     def nudge(self, direction: str, distance_m: float = 50,
               altitude_change: float = 0) -> str:
         """
-        Make a SHORT, IMMEDIATE move to avoid an obstacle or adjust position
-        RIGHT NOW, without committing to a full mission or an indefinite loiter.
+        Make a SHORT, IMMEDIATE detour to avoid an obstacle RIGHT NOW, then
+        automatically rejoin whatever mission was already running — like a
+        car swerving around a pothole and settling back into its lane. If a
+        mission is currently active, the plane flies through the detour
+        point and continues straight into its original remaining waypoints;
+        it does NOT stop to orbit.
 
         direction: compass (north/south/east/west/etc), OR relative to the
                    plane's CURRENT HEADING ('left', 'right'), OR vertical
@@ -1718,8 +2393,9 @@ class PlaneToolkit(Toolkit):
 
         Use this instead of loiter_here() when the goal is to steer around
         something and keep moving — not to stop and hold position.
-        The plane briefly stabilises after the nudge; follow up with another
-        command (continue original heading, fly_direction, execute_plan, etc.)
+        If there is NO active mission to rejoin, the plane briefly stabilises
+        at the detour point instead (single orbit) and waits for your next
+        command — there's nothing to automatically continue into.
         """
         ok, msg = _safety_check(None)  # altitude validated dynamically in executor
         command_queue.put({
@@ -1730,24 +2406,42 @@ class PlaneToolkit(Toolkit):
         })
         return f"nudge({direction}, {distance_m}m) queued — brief avoidance manoeuvre."
 
-    def fly_racetrack(self, heading: str, leg_length_m: float = 400,
-                      turn_radius_m: float = 150, turn_direction: str = "right",
+    def fly_racetrack(self, heading: str, leg_length_m: float = 84.39,
+                      turn_radius_m: float = 36.5, turn_direction: str = "right",
                       laps: int = 3, altitude: float = None,
-                      location_name: str = None,
+                      location_name: str = None, arc_points: int = 16,
                       end_with_rtl: bool = False, end_with_land: bool = False) -> str:
         """
-        Fly a racetrack / holding-pattern oval: two straight legs joined by
-        two turns, like an aviation holding pattern. Use for 'racetrack',
-        'holding pattern', 'oval', 'orbit back and forth', or loitering over
-        a stretched-out area (e.g. a road or ridge) rather than a tight circle.
+        Fly a racetrack / "running track" oval: two straight, parallel legs
+        joined by two genuinely CURVED semicircular turns — a clean stadium
+        shape like an athletics track, not an elongated aviation holding
+        pattern and not a thin back-and-forth line. Use for 'racetrack',
+        'running track', 'track shape', 'oval', 'stadium loop'.
 
         heading: compass direction of the OUTBOUND leg (e.g. 'north', 90).
-        leg_length_m: length of each straight leg (default 400m).
-        turn_radius_m: radius of the two end turns (default 150m).
+        leg_length_m: length of each straight leg (default 84.39m, matching
+                       a real IAAF 400m track's straight length).
+        turn_radius_m: radius of the two curved end turns (default 36.5m,
+                       matching a real 400m track's curve) — this ALSO sets
+                       how far apart the two straight legs are (2x
+                       turn_radius_m), so widening it makes the whole track
+                       wider, not just the turn tighter/looser.
+                       NOTE: 36.5m is a tight radius for a fixed-wing plane
+                       at cruise airspeed — it requires roughly a 35+ degree
+                       bank to hold. ArduPlane may fly a slightly wider
+                       actual circle than commanded if that's outside a
+                       comfortable turn rate; slow down first with
+                       set_speed() if the shape looks rounded-out rather
+                       than tight, or widen turn_radius_m if a true
+                       running-track radius isn't achievable at the
+                       plane's current airspeed.
         turn_direction: 'right' (clockwise, standard) or 'left' (counter-clockwise).
-        laps: number of full ovals to fly before ending (default 3).
+        laps: number of full laps to fly before ending (default 3).
         location_name: optional preset location to centre the pattern on;
                        defaults to the plane's current position.
+        arc_points: waypoints used to approximate each curved end (default
+                       16) — higher gives a smoother curve at the cost of a
+                       longer mission list; lower is more angular/faceted.
         """
         alt = altitude or vehicle.location.global_relative_frame.alt or 60
         ok, msg = _safety_check(alt)
@@ -1756,6 +2450,7 @@ class PlaneToolkit(Toolkit):
             "action": "racetrack", "heading": heading,
             "leg_length_m": leg_length_m, "turn_radius_m": turn_radius_m,
             "turn_direction": turn_direction, "laps": laps, "altitude": alt,
+            "arc_points": arc_points,
             "end_with_rtl": end_with_rtl, "end_with_land": end_with_land,
         }
         if location_name:
@@ -1997,6 +2692,14 @@ For any route with destinations, use this pattern:
 RULE: ALWAYS call execute_plan() after add_stop / add_stop_by_name.
 RULE: 'return home' / 'go back' / 'RTL' = execute_plan(end_with_rtl=True) OR return_home().
 RULE: 'land' / 'touch down' / 'full stop' (no urgency, default) = execute_plan(end_with_land=True) OR land().
+RULE: 'land on runway X' / 'land on the runway' / 'land aligned' = land_on_runway(threshold, opposite_end).
+      Use this instead of plain land() whenever the operator names a specific
+      runway or wants the approach VISIBLY LINED UP with the runway (matters
+      on the live map). threshold = the runway end to land at (e.g. "runway
+      35"), opposite_end = the other end of the same strip (e.g. "runway
+      17") — used only to compute the real approach heading. If the
+      operator just says "land on the runway" with no number, default to
+      threshold="runway 35", opposite_end="runway 17".
 RULE: 'land here' / 'land now' / 'emergency landing' / 'land at my position' / land
       requests where flying back home is NOT mentioned or NOT desired = land_here().
       land_here() lands at the CURRENT position, NOT home, and automatically
@@ -2026,22 +2729,37 @@ land_here() automatically calls a safety check before touching down:
 
 ═══ OBSTACLE AVOIDANCE / SHORT MANOEUVRES ══════════════════════════════
 For requests like 'go left to avoid that', 'go up a bit', 'move right',
-'climb to avoid the hill' — use nudge(), NOT loiter_here().
+'climb to avoid the hill', 'there's an object, move right' — call nudge()
+and NOTHING ELSE. Do NOT also call loiter_here() or set_flight_mode('LOITER')
+for these — even though the word 'object' or 'obstacle' sounds like a
+warning, the operator wants ONE brief detour, not a stop. Calling both
+nudge() and loiter_here() in the same turn is WRONG: loiter_here() clears
+the queue and forces LOITER mode, which cancels the detour's automatic
+mission-rejoin and leaves the plane circling instead of continuing.
   nudge('left', 80)             steer left of current heading 80m, then continue
   nudge('up', 20)                climb 20m, then continue
   nudge('east', 100, altitude_change=10)   move + climb together
-nudge() does a brief single-orbit stabilise then waits for the next command —
-it does NOT loiter indefinitely. Use loiter_here() only when the operator
-explicitly wants to stop and hold position, not to dodge something while
-continuing onward.
+nudge() flies the brief detour then AUTOMATICALLY REJOINS whatever mission
+was already running — like a car swerving around a pothole and settling
+back into its lane. It does NOT stop to orbit if a mission is active. Only
+if there's no active mission does it fall back to a brief single-orbit
+stabilise while waiting for the next command.
+RULE: 'there is an obstacle/object, move X' = nudge(X, ...) ONLY. Never
+      follow it with loiter_here(), hold, or a mode change — the plane
+      should keep flying, just briefly offset.
+Use loiter_here() only when the operator EXPLICITLY says stop, hold, wait,
+pause, or freeze — not as a reaction to an obstacle being mentioned.
 
 ═══ NON-STANDARD ORBIT PATTERNS ══════════════════════════════════════
 Use these instead of a plain loiter/execute_plan when the operator wants a
 SHAPE, not just a point to orbit:
 
-  'racetrack' / 'holding pattern' / 'oval' / loiter over something elongated:
-    fly_racetrack(heading='north', leg_length_m=400, turn_radius_m=150,
+  'racetrack' / 'running track' / 'track shape' / 'oval' / 'stadium loop':
+    fly_racetrack(heading='north', leg_length_m=84.39, turn_radius_m=36.5,
                    turn_direction='right', laps=3)
+    Defaults match a real 400m running track's proportions (straights +
+    tight uniform curves). Pass a larger leg_length_m/turn_radius_m if the
+    operator wants a wider aviation-style holding-pattern oval instead.
 
   'figure eight' / 'figure 8' / S-turns / cover both sides of a line:
     fly_figure_eight(heading='north', lobe_radius_m=150, loops=2,
@@ -2083,6 +2801,7 @@ WP_LOITER_RAD = 300m (arrival threshold — plane orbits within this radius).
 ═══ TOOLS ════════════════════════════════════════════════════════════
 arm_plane() | disarm_plane() | takeoff(alt) | return_home() | land()
 land_here(force) | check_safe_to_land(lat,lon)
+land_on_runway(threshold,opposite_end,approach_alt,pre_approach_dist_m,final_approach_dist_m,final_approach_alt)
 loiter_here() | resume_flight()
 add_stop(lat,lon,alt,dwell_seconds) | add_stop_by_name(name,alt,dwell_seconds)
 execute_plan(end_with_land,end_with_rtl) | clear_plan()
@@ -2131,7 +2850,7 @@ _lm = LearningMachine(
 
 def _build_agent():
     comp = CompressionManager(
-        model=OpenRouter(id="google/gemini-2.0-flash-001", extra_body=_NO_THINK),
+        model=ACTIVE_MODEL,
         compress_tool_results_limit=20,
         compress_tool_call_instructions=(
             "Summarise this plane tool result in one line. "
@@ -2578,6 +3297,7 @@ print("""
   >> take off to 80 meters
   >> return home                         fly home and LOITER (no landing)
   >> land                                approach and TOUCH DOWN at home
+  >> land on runway 35                   aligned approach, lands ON the runway
   >> land here / emergency landing       land at CURRENT position (checked)
   >> disarm                              GROUND ONLY — blocked if airborne
   >> stop / hold / loiter here           orbit current position (LOITER)
@@ -2607,14 +3327,14 @@ print("""
   >> visit residence 1 and residence 2 then land
 
   ── OBSTACLE AVOIDANCE / SHORT MOVES ─────────────────────────────────
-  >> go left 80 meters                   steer around something, then wait
-  >> climb 20 meters                     short up-nudge, then wait
-  >> move right and climb 10 meters      lateral + altitude nudge
+  >> go left 80 meters                   detour, then auto-rejoin the mission
+  >> climb 20 meters                     brief climb, then auto-rejoin
+  >> move right and climb 10 meters      lateral + altitude detour, rejoins
   These are brief manoeuvres (single orbit) — not indefinite loiters.
   Follow up with your next instruction once clear.
 
   ── NON-STANDARD ORBIT PATTERNS ──────────────────────────────────────
-  >> fly a racetrack heading north for 3 laps        holding-pattern oval
+  >> fly a racetrack heading north for 3 laps        running-track oval shape
   >> fly a figure eight over the airfield             tangent lobes, crossing
   >> survey camp a in a lawnmower pattern 800 by 400  boustrophedon grid
 
@@ -2645,15 +3365,43 @@ print("=" * 70 + "\n")
 # MAIN LOOP
 # ───────────────────────────────────────────────────────────────
 while True:
+    if flight_bridge is not None:
+        try:
+            entries = flight_bridge.poll()
+        except Exception as _pe:
+            # REST call failed (backend down, network blip, etc) — fall back
+            # to local terminal input for this iteration rather than crash;
+            # next loop will try the bridge again.
+            flog("warning", f"flight_bridge.poll() failed: {_pe}")
+            entries = []
+        if not entries:
+            time.sleep(flight_bridge.poll_interval)
+            continue
+        # Process each queued operator message in order; _handle() itself
+        # is already fire-and-forget for agent calls (_run_async), so this
+        # does not block waiting for a reply before reading the next one.
+        for _entry in entries:
+            user_input = (_entry.get("text") or "").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ("exit", "quit"):
+                print("Exiting.")
+                flog("info", f"SESSION END — {SESSION_ID} | user exit via chat")
+                flight_bridge.close()
+                sys.exit(0)
+            _handle(user_input)
+        continue
+
     try:
         user_input = input(">> ").strip()
     except (KeyboardInterrupt, EOFError):
         print("\nShutting down.")
         flog("info", f"SESSION END — {SESSION_ID} | KeyboardInterrupt")
         break
+
     if not user_input:
         continue
-    if user_input.lower() in ("exit","quit"):
+    if user_input.lower() in ("exit", "quit"):
         print("Exiting.")
         flog("info", f"SESSION END — {SESSION_ID} | user exit")
         break
