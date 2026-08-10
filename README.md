@@ -463,7 +463,7 @@ The AVA WebUI repository is private, so you will need access before using this o
 Once you have it:
 
 🔗 
-https://github.com/KashmirWorld/ava-webui/tree/cesiumm
+[https://github.com/KashmirWorld/ava-webui/tree/cesiumm](https://github.com/KashmirWorld/ava-webui/tree/cesium)
 
 Clone it and follow the setup instructions in its own README to get the app running locally (cesium branch).
 
