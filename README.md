@@ -401,7 +401,7 @@ Disarm.
 ### Navigation
 
 ```text
-Fly north 2 kilometers.
+Fly north 70 meters.
 
 Go to the hospital.
 
@@ -460,7 +460,12 @@ The aircraft can also be controlled through a browser-based chat interface inste
 
 The AVA WebUI repository is private, so you will need access before using this option.
 
-Once you have access, use the `cesium` branch and follow its own README for setup.
+Once you have it:
+
+🔗 
+https://github.com/KashmirWorld/ava-webui/tree/cesiumm
+
+Clone it and follow the setup instructions in its own README to get the app running locally (cesium branch).
 
 When starting the WebUI, use:
 
