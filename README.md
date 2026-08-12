@@ -350,7 +350,6 @@ For a real project, using an environment variable or `.env` file is recommended 
 ---
 
 ## Running the Simulation
-<img width="1917" height="912" alt="Screenshot 2026-08-11 190105" src="https://github.com/user-attachments/assets/43c92316-06af-451c-95fd-478ef0a1b10c" />
 
 ### 1. Start ArduPilot SITL
 
@@ -459,6 +458,7 @@ Resume.
 ---
 
 ## Optional: Browser Control via AVA WebUI
+<img width="1917" height="912" alt="Screenshot 2026-08-11 190105" src="https://github.com/user-attachments/assets/43c92316-06af-451c-95fd-478ef0a1b10c" />
 
 The aircraft can also be controlled through a browser-based chat interface instead of the terminal using the **AVA WebUI** project.
 
