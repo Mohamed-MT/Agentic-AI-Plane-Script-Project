@@ -54,6 +54,8 @@ The system can:
 Everything runs in simulation, making the project suitable for experimentation, development, and learning without requiring a physical aircraft.
 
 ---
+<img width="1721" height="914" alt="image" src="https://github.com/user-attachments/assets/ec1e2f31-b96c-4efa-8fcd-aab33736633a" />
+
 
 ## How It Works
 
@@ -185,6 +187,7 @@ Hold position.
 ## Runway Landing
 
 A command such as:
+<img width="1917" height="1016" alt="Screenshot 2026-08-11 190507" src="https://github.com/user-attachments/assets/bdd81b61-85c7-4350-97b9-f9ee4782ffb3" />
 
 ```text
 Land on runway 35.
@@ -347,6 +350,7 @@ For a real project, using an environment variable or `.env` file is recommended 
 ---
 
 ## Running the Simulation
+<img width="1917" height="912" alt="Screenshot 2026-08-11 190105" src="https://github.com/user-attachments/assets/43c92316-06af-451c-95fd-478ef0a1b10c" />
 
 ### 1. Start ArduPilot SITL
 
