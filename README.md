@@ -1,3 +1,16 @@
+<table>
+  <tr>
+    <td width="260">
+      <img width="250" alt="AI Plane Flight Agent" src="https://github.com/user-attachments/assets/fd10e2f2-4918-4b37-9ce8-10b3aaeed8c0" />
+    </td>
+    <td>
+      <h1>AI Plane Flight Agent</h1>
+      <p><strong>Autonomous Flight. Smarter Decisions.</strong></p>
+      <p>An intelligent flight navigation and decision-making agent powered by real-time telemetry and terrain mapping.</p>
+    </td>
+  </tr>
+</table>
+
 # AI Plane Flight Agent | Natural-Language Fixed-Wing Control
 
 Control a simulated fixed-wing aircraft using plain English.
